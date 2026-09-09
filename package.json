@@ -1,0 +1,21 @@
+{
+  "name": "tracking-setup-agent",
+  "version": "2.0.0",
+  "description": "Agente automatizado para configurar GTM, GA4, Cloudflare Workers e D1 para rastreamento server-side",
+  "main": "setup.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node setup.mjs",
+    "setup": "node setup.mjs",
+    "test": "node test/worker.test.mjs",
+    "build:worker": "node -e \"import('./lib/cloudflare.mjs').then(m=>process.stdout.write(m.buildWorkerBundle()))\" > worker/bundle.generated.mjs",
+    "panel": "npm --prefix crm-panel run dev"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "chalk": "^5.3.0",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0",
+    "googleapis": "^140.0.1"
+  }
+}

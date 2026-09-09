@@ -1,0 +1,425 @@
+import dotenv from 'dotenv';
+import { google } from 'googleapis';
+import axios from 'axios';
+import { createClient } from '@libsql/client';
+import FormData from 'form-data';
+import chalk from 'chalk';
+import fs from 'fs';
+
+dotenv.config();
+
+const requiredEnvVars = [
+  'GTM_ACCOUNT_ID',
+  'GTM_CONTAINER_NAME',
+  'GA4_MEASUREMENT_ID',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'CLOUDFLARE_API_TOKEN',
+  'CLOUDFLARE_ACCOUNT_ID',
+  'TURSO_DATABASE_URL',
+  'TURSO_AUTH_TOKEN'
+];
+
+async function setupDatabase() {
+  console.log(chalk.blue('Configurando banco de dados no Turso...'));
+  const client = createClient({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN
+  });
+
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_name TEXT,
+      gclid TEXT,
+      gbraid TEXT,
+      wbraid TEXT,
+      fbc TEXT,
+      fbp TEXT,
+      transaction_id TEXT,
+      value REAL,
+      currency TEXT,
+      raw_params TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS purchases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transaction_id TEXT,
+      value REAL,
+      currency TEXT,
+      raw_payload TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  console.log(chalk.green('Tabelas criadas/verificadas com sucesso.'));
+}
+
+async function setupGTM() {
+  console.log(chalk.blue('Configurando Google Tag Manager...'));
+  
+  if (!fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
+    throw new Error(`Arquivo de credenciais do Google não encontrado em: ${process.env.GOOGLE_APPLICATION_CREDENTIALS}`);
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    scopes: ['https://www.googleapis.com/auth/tagmanager.edit.containers', 'https://www.googleapis.com/auth/tagmanager.publish']
+  });
+
+  const tagmanager = google.tagmanager({ version: 'v2', auth });
+  const accountPath = `accounts/${process.env.GTM_ACCOUNT_ID}`;
+
+  // 1. Criar o container web
+  console.log('TRACE: Going to call containers.create');
+  const containerRes = await tagmanager.accounts.containers.create({
+    parent: accountPath,
+    requestBody: {
+      name: process.env.GTM_CONTAINER_NAME,
+      usageContext: ['web']
+    }
+  });
+  
+  const container = containerRes.data;
+  const containerPath = container.path;
+  console.log(chalk.green(`Container GTM criado: ${container.name} (${container.publicId})`));
+
+  // 2. Obter workspace default
+  const workspacesRes = await tagmanager.accounts.containers.workspaces.list({ parent: containerPath });
+  const workspace = workspacesRes.data.workspace[0];
+  const workspacePath = workspace.path;
+
+  // 3. Habilitar variáveis built-in importantes
+  console.log('TRACE: Going to call built_in_variables.create');
+  await tagmanager.accounts.containers.workspaces.built_in_variables.create({
+    parent: workspacePath,
+    type: ['clickUrl', 'pageUrl']
+  });
+
+  // 4. Criar variável constante 'transporturl' com placeholder
+  console.log('TRACE: Going to call variables.create for transporturl');
+  const transportVarRes = await tagmanager.accounts.containers.workspaces.variables.create({
+    parent: workspacePath,
+    requestBody: {
+      name: 'transporturl',
+      type: 'c', // constante
+      parameter: [{ type: 'template', key: 'value', value: 'https://placeholder.workers.dev' }]
+    }
+  });
+
+  // 5. Criar variáveis de URL (Query Parameters)
+  const urlVars = ['gclid', 'gbraid', 'wbraid', 'fbc', 'fbp'];
+  for (const v of urlVars) {
+    console.log(`TRACE: Going to call variables.create for ${v}`);
+    await tagmanager.accounts.containers.workspaces.variables.create({
+      parent: workspacePath,
+      requestBody: {
+        name: `${v.toUpperCase()} - URL`,
+        type: 'u', // URL type
+        parameter: [
+          { type: 'template', key: 'component', value: 'QUERY' },
+          { type: 'template', key: 'queryKey', value: v }
+        ]
+      }
+    });
+  }
+
+  // 6. Criar Triggers (Acionadores)
+  console.log('TRACE: Going to call triggers.create for pageview');
+  const pageViewTriggerRes = await tagmanager.accounts.containers.workspaces.triggers.create({
+    parent: workspacePath,
+    requestBody: {
+      name: 'All Pages Trigger',
+      type: 'pageview'
+    }
+  });
+  
+  console.log('TRACE: Going to call triggers.create for checkout');
+  const checkoutTriggerRes = await tagmanager.accounts.containers.workspaces.triggers.create({
+    parent: workspacePath,
+    requestBody: {
+      name: 'Click - begin_checkout',
+      type: 'linkClick',
+      filter: [
+        {
+          type: 'contains',
+          parameter: [
+            { type: 'template', key: 'arg0', value: '{{Click URL}}' },
+            { type: 'template', key: 'arg1', value: '/checkout' }
+          ]
+        }
+      ]
+    }
+  });
+
+  const purchaseTriggerRes = await tagmanager.accounts.containers.workspaces.triggers.create({
+    parent: workspacePath,
+    requestBody: {
+      name: 'Custom Event - purchase',
+      type: 'customEvent',
+      customEventFilter: [
+        {
+          type: 'equals',
+          parameter: [
+            { type: 'template', key: 'arg0', value: '{{_event}}' },
+            { type: 'template', key: 'arg1', value: 'purchase' }
+          ]
+        }
+      ]
+    }
+  });
+
+  // 7. Criar Tag de Configuração do GA4 (gaawc)
+  await tagmanager.accounts.containers.workspaces.tags.create({
+    parent: workspacePath,
+    requestBody: {
+      name: 'GA4 - Config',
+      type: 'gaawc',
+      parameter: [
+        { type: 'template', key: 'measurementId', value: process.env.GA4_MEASUREMENT_ID },
+        { type: 'boolean', key: 'sendPageView', value: 'true' },
+        { type: 'template', key: 'serverContainerUrl', value: '{{transporturl}}' }
+      ],
+      firingTriggerId: [pageViewTriggerRes.data.triggerId]
+    }
+  });
+
+  // Helper para Tag de Evento GA4
+  const createGA4EventTag = async (name, eventName, triggerId, addEcomParams = false) => {
+    const parameters = [
+      { type: 'map', map: [{ type: 'template', key: 'name', value: 'gclid' }, { type: 'template', key: 'value', value: '{{GCLID - URL}}' }]},
+      { type: 'map', map: [{ type: 'template', key: 'name', value: 'gbraid' }, { type: 'template', key: 'value', value: '{{GBRAID - URL}}' }]},
+      { type: 'map', map: [{ type: 'template', key: 'name', value: 'wbraid' }, { type: 'template', key: 'value', value: '{{WBRAID - URL}}' }]},
+      { type: 'map', map: [{ type: 'template', key: 'name', value: 'fbc' }, { type: 'template', key: 'value', value: '{{FBC - URL}}' }]},
+      { type: 'map', map: [{ type: 'template', key: 'name', value: 'fbp' }, { type: 'template', key: 'value', value: '{{FBP - URL}}' }]}
+    ];
+
+    if (addEcomParams) {
+      parameters.push(
+        { type: 'map', map: [{ type: 'template', key: 'name', value: 'transaction_id' }, { type: 'template', key: 'value', value: '{{Transaction ID}}' }]},
+        { type: 'map', map: [{ type: 'template', key: 'name', value: 'value' }, { type: 'template', key: 'value', value: '{{Value}}' }]},
+        { type: 'map', map: [{ type: 'template', key: 'name', value: 'currency' }, { type: 'template', key: 'value', value: '{{Currency}}' }]}
+      );
+    }
+
+    return tagmanager.accounts.containers.workspaces.tags.create({
+      parent: workspacePath,
+      requestBody: {
+        name: name,
+        type: 'gaawe',
+        parameter: [
+          { type: 'template', key: 'measurementIdOverride', value: process.env.GA4_MEASUREMENT_ID },
+          { type: 'template', key: 'eventName', value: eventName },
+          { type: 'list', key: 'eventParameters', list: parameters }
+        ],
+        firingTriggerId: [triggerId]
+      }
+    });
+  };
+
+  // 8. Criar Tags de Evento
+  await createGA4EventTag('GA4 - begin_checkout', 'begin_checkout', checkoutTriggerRes.data.triggerId, false);
+  await createGA4EventTag('GA4 - purchase', 'purchase', purchaseTriggerRes.data.triggerId, true); // Supõe que variáveis dataLayer Transaction ID/Value existam ou serão criadas.
+
+  return {
+    workspacePath,
+    transportVarId: transportVarRes.data.variableId,
+    tagmanager,
+    containerPublicId: container.publicId
+  };
+}
+
+async function deployWorker() {
+  console.log(chalk.blue('Fazendo deploy do Cloudflare Worker...'));
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+  const token = process.env.CLOUDFLARE_API_TOKEN;
+  const scriptName = 'tracking-worker-agent';
+
+// Código do Worker sem imports externos para evitar erro 10021 da Cloudflare
+  const workerCode = `
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    
+    // Configurações injetadas dinamicamente
+    const dbUrl = "${process.env.TURSO_DATABASE_URL}".replace('libsql://', 'https://');
+    const authToken = "${process.env.TURSO_AUTH_TOKEN}";
+
+    async function executeSql(sql, args = []) {
+      const res = await fetch(dbUrl + "/v2/pipeline", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + authToken,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          requests: [
+            { type: "execute", stmt: { sql, args } },
+            { type: "close" }
+          ]
+        })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    // Endpoint GA4 transport url
+    if (url.pathname === '/g/collect' && request.method === 'GET') {
+      const params = Object.fromEntries(url.searchParams);
+      const eventName = params.en || 'page_view';
+      const gclid = params.gclid || null;
+      const gbraid = params.gbraid || null;
+      const wbraid = params.wbraid || null;
+      const fbc = params.fbc || null;
+      const fbp = params.fbp || null;
+      const tid = params.ti || null; // transaction_id
+      const val = params.tr || null; // value
+      const curr = params.cu || null; // currency
+
+      try {
+        await executeSql(
+          'INSERT INTO events (event_name, gclid, gbraid, wbraid, fbc, fbp, transaction_id, value, currency, raw_params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [{type: "text", value: eventName}, {type: "text", value: gclid}, {type: "text", value: gbraid}, {type: "text", value: wbraid}, {type: "text", value: fbc}, {type: "text", value: fbp}, {type: "text", value: tid}, {type: "text", value: val}, {type: "text", value: curr}, {type: "text", value: JSON.stringify(params)}]
+        );
+      } catch(err) {
+        console.error("Erro ao salvar no DB:", err.message);
+      }
+      
+      // Resposta com CORS liberado
+      return new Response('ok', { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
+    }
+
+    // Endpoint Webhook para a plataforma de vendas
+    if (url.pathname === '/webhook' && request.method === 'POST') {
+      try {
+        const data = await request.json();
+        const eventName = data.event || 'purchase';
+        const tid = data.transaction_id || null;
+        const val = data.value || null;
+        const curr = data.currency || null;
+
+        await executeSql(
+          'INSERT INTO purchases (transaction_id, value, currency, raw_payload) VALUES (?, ?, ?, ?)',
+          [{type: "text", value: tid}, {type: "text", value: val}, {type: "text", value: curr}, {type: "text", value: JSON.stringify(data)}]
+        );
+
+        // Retorna 200 OK rapidamente para plataforma
+        return new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 400 });
+      }
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+};
+`;
+
+  const formData = new FormData();
+  formData.append('index.js', workerCode, { filename: 'index.js', contentType: 'application/javascript+module' });
+  formData.append('metadata', JSON.stringify({ main_module: 'index.js' }), { contentType: 'application/json' });
+
+  const workerUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}`;
+  
+  await axios.put(workerUrl, formData, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      ...formData.getHeaders()
+    }
+  });
+
+  // Tentar obter o subdomínio da conta
+  let finalWorkerUrl = `https://${scriptName}.workers.dev`; // Fallback genérico
+  try {
+    const subRes = await axios.get(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (subRes.data && subRes.data.result && subRes.data.result.subdomain) {
+      finalWorkerUrl = `https://${scriptName}.${subRes.data.result.subdomain}.workers.dev`;
+    }
+    
+    // Habilitar a rota para acesso .workers.dev
+    await axios.post(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, {
+      enabled: true
+    }, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+  } catch (err) {
+    console.log(chalk.yellow('Aviso: Não foi possível configurar o subdomínio automaticamente. Verifique o dashboard da Cloudflare.'));
+  }
+
+  console.log(chalk.green(`Worker feito o deploy com sucesso! URL: ${finalWorkerUrl}`));
+  return finalWorkerUrl;
+}
+
+async function updateGTMTransportUrl(gtmContext, finalWorkerUrl) {
+  console.log(chalk.blue('Atualizando URL de transporte no GTM...'));
+  const { workspacePath, transportVarId, tagmanager } = gtmContext;
+  
+  await tagmanager.accounts.containers.workspaces.variables.update({
+    path: `${workspacePath}/variables/${transportVarId}`,
+    requestBody: {
+      name: 'transporturl',
+      type: 'c',
+      parameter: [{ type: 'template', key: 'value', value: finalWorkerUrl }]
+    }
+  });
+
+  console.log(chalk.blue('Criando versão e publicando container...'));
+  const versionRes = await tagmanager.accounts.containers.workspaces.versions.create({
+    path: workspacePath,
+    requestBody: {
+      name: 'Versão Setup Tracker Automático',
+      notes: 'Gerado automaticamente pelo Agente.'
+    }
+  });
+
+  const versionPath = versionRes.data.containerVersion.path;
+  await tagmanager.accounts.containers.versions.publish({
+    path: versionPath
+  });
+
+  console.log(chalk.green('GTM Container Publicado com sucesso!'));
+}
+
+async function setup() {
+  try {
+    console.log(chalk.bgBlue.white.bold('=== Iniciando Setup do Tracking Ecossistema ==='));
+    
+    // Validação de variáveis de ambiente
+    for (const envVar of requiredEnvVars) {
+      if (!process.env[envVar]) {
+        throw new Error(`Variável de ambiente ausente: ${envVar}`);
+      }
+    }
+
+    await setupDatabase();
+    
+    const gtmContext = await setupGTM();
+    
+    const workerUrl = await deployWorker();
+    
+    await updateGTMTransportUrl(gtmContext, workerUrl);
+    
+    console.log(chalk.bgGreen.black.bold('\n=== Setup Finalizado com Sucesso! ==='));
+    console.log(chalk.white(`ID do Container GTM: ${gtmContext.containerPublicId}`));
+    console.log(chalk.white(`Endpoint de hits: ${workerUrl}/g/collect`));
+    console.log(chalk.white(`Endpoint do Webhook: ${workerUrl}/webhook`));
+    
+  } catch (error) {
+    console.error(chalk.red('\n=== Erro no Setup ==='));
+    if (error.response && error.response.data) {
+      console.error(chalk.red(JSON.stringify(error.response.data, null, 2)));
+    } else {
+      console.error(chalk.red(error.message || error));
+    }
+    process.exit(1);
+  }
+}
+
+setup();

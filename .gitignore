@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.env
+.env.local
+service-account.json
+tracking.config.json
+tracking.state.json
+tracking.profiles.json
+worker/bundle.generated.mjs
+keys.txt
+*.log

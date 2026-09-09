@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "crm-panel",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "crm-panel", "run", "dev"],
+      "port": 3000,
+      "autoPort": true
+    },
+    {
+      "name": "crm-panel-prod",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "crm-panel", "run", "start"],
+      "port": 3000,
+      "autoPort": true
+    }
+  ]
+}
